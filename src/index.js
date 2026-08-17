@@ -46,6 +46,24 @@ function formatIst(d) {
   }).format(d);
 }
 
+const PUBLIC_BASE = (process.env.RENDER_EXTERNAL_URL || "https://truffles-guest-mcp.onrender.com").replace(/\/$/, "");
+const PAY_CODE = "paidonline";
+
+async function fetchDishImage(url) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  try {
+    const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const mime = String(res.headers.get("content-type") || "image/jpeg").split(";")[0];
+    if (!mime.startsWith("image/")) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length || buf.length > 700000) return null;
+    return { mimeType: mime, data: buf.toString("base64") };
+  } catch {
+    return null;
+  }
+}
+
 const BUSY = ["occupied", "awaiting_payment", "reserved"];
 
 function createMcpServer() {
@@ -78,10 +96,11 @@ function createMcpServer() {
     "view_menu",
     {
       title: "View menu",
-      description: "Show the Truffles menu for a Bengaluru outlet. Menu items come from the live menu_items table.",
+      description:
+        "Show the Truffles menu WITH dish photos. Always display the returned images so the guest can pick items, then call create_prebook. After pre-book, share payment_link and tell them to type paidonline when payment is done.",
       inputSchema: {
         outlet: z.string().describe("Outlet area, e.g. Indiranagar"),
-        search: z.string().optional().describe("Optional item name filter")
+        search: z.string().optional().describe("Optional item name or category filter")
       }
     },
     async ({ outlet, search }) => {
@@ -92,12 +111,12 @@ function createMcpServer() {
       }
       let { data, error } = await db()
         .from("menu_items")
-        .select("id, item_name, price, available, veg, category_id, menu_categories(category_name)")
+        .select("id, item_name, price, available, veg, image_url, category_id, menu_categories(category_name)")
         .limit(80);
       if (error) {
         const retry = await db()
           .from("menu_items")
-          .select("id, item_name, price, available, veg")
+          .select("id, item_name, price, available, veg, image_url")
           .limit(80);
         data = retry.data;
         error = retry.error;
@@ -106,16 +125,48 @@ function createMcpServer() {
       const needle = String(search || "").toLowerCase();
       const items = (data || [])
         .filter((row) => row.available !== false)
-        .filter((row) => !needle || String(row.item_name || "").toLowerCase().includes(needle))
+        .filter((row) => {
+          if (!needle) return true;
+          const cat = String(row.menu_categories?.category_name || "").toLowerCase();
+          return String(row.item_name || "").toLowerCase().includes(needle) || cat.includes(needle);
+        })
         .map((row) => ({
           id: row.id,
           name: row.item_name,
-          price: row.price,
+          price: Number(row.price) || 0,
           veg: row.veg,
-          category: row.menu_categories?.category_name || null
+          category: row.menu_categories?.category_name || null,
+          image_url: row.image_url || null
         }));
       const branch = findOutlet(outlet)[0] || OUTLETS[0];
-      return json({ outlet: branch, items });
+      const withPhotos = items.filter((i) => i.image_url).slice(0, 12);
+      const photos = await Promise.all(withPhotos.map((i) => fetchDishImage(i.image_url)));
+      const content = [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              outlet: branch,
+              how_to_order:
+                "Show every dish photo below. Guest picks names and qty. Then create_prebook. Share payment_link. When they type paidonline, call confirm_payment.",
+              items
+            },
+            null,
+            2
+          )
+        }
+      ];
+      withPhotos.forEach((item, idx) => {
+        const img = photos[idx];
+        if (img) {
+          content.push({ type: "image", mimeType: img.mimeType, data: img.data });
+        }
+        content.push({
+          type: "text",
+          text: `${item.name} — ₹${item.price}${item.veg ? " (veg)" : ""} [${item.category || "Menu"}]`
+        });
+      });
+      return { content };
     }
   );
 
@@ -266,9 +317,11 @@ function createMcpServer() {
 
       const { data: menu } = await db().from("menu_items").select("id, item_name, price");
       const lines = args.items.map((item) => {
-        const match = (menu || []).find(
-          (m) => String(m.item_name || "").toLowerCase() === item.name.toLowerCase()
-        );
+        const want = String(item.name || "").toLowerCase();
+        const match = (menu || []).find((m) => {
+          const have = String(m.item_name || "").toLowerCase();
+          return have === want || have.includes(want) || want.includes(have);
+        });
         const price = Number(item.price ?? match?.price ?? 0);
         const qty = Number(item.qty || 1);
         return {
@@ -283,6 +336,7 @@ function createMcpServer() {
       const total = lines.reduce((sum, line) => sum + line.price * line.qty, 0);
       const ticket = `MCP-${Date.now().toString().slice(-6)}`;
       const branch = findOutlet(args.outlet)[0];
+      const paymentLink = `${PUBLIC_BASE}/pay?ticket=${encodeURIComponent(ticket)}&amount=${encodeURIComponent(String(total))}&name=${encodeURIComponent(args.customer_name)}`;
 
       const fullPayload = {
         customer_name: args.customer_name,
@@ -310,8 +364,60 @@ function createMcpServer() {
       return json({
         ok: true,
         ticket,
-        message: `Pre-booked for ${args.customer_name}. Returning Member with this phone should restore items. POS can assign a table from the pre-order queue.`,
+        total,
+        payment_link: paymentLink,
+        payment_code: PAY_CODE,
+        message: `Pre-booked for ${args.customer_name}, ticket ${ticket}, total ₹${total}. Share this payment link: ${paymentLink}. Tell the guest: after paying, type exactly "${PAY_CODE}" in this chat. Then call confirm_payment.`,
         order: data?.[0]
+      });
+    }
+  );
+
+  server.registerTool(
+    "confirm_payment",
+    {
+      title: "Confirm payment",
+      description:
+        "Mark a pre-book as paid. Call this when the guest types paidonline (the success code) after opening the payment link.",
+      inputSchema: {
+        code: z.string().describe("Guest typed this. Success code is paidonline"),
+        ticket: z.string().optional().describe("MCP ticket e.g. MCP-123456"),
+        customer_phone: z.string().optional()
+      }
+    },
+    async (args) => {
+      const typed = String(args.code || "").toLowerCase().replace(/\s+/g, "");
+      if (typed !== PAY_CODE) {
+        return json({
+          ok: false,
+          message: `That is not the success code. Ask the guest to type ${PAY_CODE} after they open the payment link.`
+        });
+      }
+      const ticket = String(args.ticket || "").trim();
+      const phone = digitsOnly(args.customer_phone).slice(-10);
+      let q = db().from("orders").select("*").eq("is_preorder", true).order("created_at", { ascending: false }).limit(10);
+      if (ticket) q = q.eq("preorder_ticket", ticket);
+      else if (phone) q = q.eq("customer_phone", phone);
+      const { data, error } = await q;
+      if (error) return text(`Payment lookup failed: ${error.message}`);
+      const order = (data || [])[0];
+      if (!order) return text("No matching pre-book found. Need the ticket or the same phone used to order.");
+
+      const { data: updated, error: uErr } = await db()
+        .from("orders")
+        .update({
+          payment_status: "Paid",
+          notes: `${order.notes || ""} | paid=${PAY_CODE}`
+        })
+        .eq("id", order.id)
+        .select();
+      if (uErr) return text(`Could not mark paid: ${uErr.message}`);
+
+      return json({
+        ok: true,
+        status: "successful",
+        message: `Payment successful for ticket ${order.preorder_ticket}. ₹${order.total || order.total_amount || 0} received (code ${PAY_CODE}). POS pre-order queue can assign a table.`,
+        order: updated?.[0]
       });
     }
   );
@@ -324,7 +430,35 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: NAME, endpoints: ["/mcp"] });
+  res.json({ ok: true, service: NAME, endpoints: ["/mcp", "/pay"] });
+});
+
+app.get("/pay", (req, res) => {
+  const ticket = String(req.query.ticket || "MCP");
+  const amount = String(req.query.amount || "0");
+  const name = String(req.query.name || "Guest");
+  res.type("html").send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Truffles pay ${ticket}</title>
+<style>
+  body{margin:0;font-family:Georgia,serif;background:#F8F6F0;color:#234A3B;padding:32px}
+  .card{max-width:420px;margin:40px auto;background:#fff;border:1px solid #d9d0c3;padding:28px}
+  h1{font-size:22px;margin:0 0 8px}
+  .amt{font-size:32px;color:#8B6B4A;margin:16px 0}
+  code{background:#234A3B;color:#F8F6F0;padding:4px 8px}
+  p{line-height:1.5}
+</style></head>
+<body>
+  <div class="card">
+    <h1>Truffles Bengaluru</h1>
+    <p>Pre-order for ${name.replace(/[<>]/g, "")}</p>
+    <p>Ticket <strong>${ticket.replace(/[<>]/g, "")}</strong></p>
+    <div class="amt">₹${amount.replace(/[<>]/g, "")}</div>
+    <p>This is a test payment page. After you are done, go back to Claude and type exactly:</p>
+    <p><code>${PAY_CODE}</code></p>
+    <p>Claude will mark this pre-order as paid.</p>
+  </div>
+</body></html>`);
 });
 
 async function handleMcp(req, res) {
