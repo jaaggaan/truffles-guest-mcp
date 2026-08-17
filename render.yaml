@@ -9,7 +9,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: NODE_VERSION
-        value: "20"
+        value: "22"
       - key: MCP_SERVER_NAME
         value: truffles-guest
       - key: SUPABASE_URL

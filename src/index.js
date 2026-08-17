@@ -9,11 +9,17 @@ import { OUTLETS, findOutlet, isOtherBrand } from "./outlets.js";
 const PORT = Number(process.env.PORT || 8080);
 const NAME = process.env.MCP_SERVER_NAME || "truffles-guest";
 
+let dbClient = null;
 function supabase() {
+  if (dbClient) return dbClient;
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !key) throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
-  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+  dbClient = createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    realtime: { fetch: globalThis.fetch }
+  });
+  return dbClient;
 }
 
 const digitsOnly = (v) => String(v || "").replace(/\D/g, "");
@@ -24,7 +30,7 @@ const BUSY = ["occupied", "awaiting_payment", "reserved"];
 
 function createMcpServer() {
   const server = new McpServer({ name: NAME, version: "1.0.0" });
-  const db = supabase();
+  const db = () => supabase();
 
   server.registerTool(
     "list_outlets",
@@ -64,7 +70,7 @@ function createMcpServer() {
           "We currently only serve Truffles in Bengaluru. Pick a Truffles outlet (Koramangala, Indiranagar, St. Marks, JP Nagar, …) to see the menu."
         );
       }
-      const { data, error } = await db
+      const { data, error } = await db()
         .from("menu_items")
         .select("id, item_name, price, category, is_available")
         .limit(80);
@@ -101,13 +107,13 @@ function createMcpServer() {
       if (Number.isNaN(start.getTime())) return text("Use date YYYY-MM-DD and time HH:MM.");
       const end = new Date(start.getTime() + 90 * 60 * 1000);
 
-      const { data: tables, error: tErr } = await db
+      const { data: tables, error: tErr } = await db()
         .from("restaurant_tables")
         .select("id, table_number, status, capacity, seats")
         .order("table_number");
       if (tErr) return text(`Table read failed: ${tErr.message}`);
 
-      const { data: holds } = await db
+      const { data: holds } = await db()
         .from("reservations")
         .select("id, table_id, start_time, end_time, status")
         .eq("status", "confirmed");
@@ -162,7 +168,7 @@ function createMcpServer() {
       if (Number.isNaN(start.getTime())) return text("Use date YYYY-MM-DD and time HH:MM.");
       const end = new Date(start.getTime() + 90 * 60 * 1000);
 
-      const { data: table, error: tErr } = await db
+      const { data: table, error: tErr } = await db()
         .from("restaurant_tables")
         .select("id, table_number, status")
         .eq("table_number", args.table_number)
@@ -182,10 +188,10 @@ function createMcpServer() {
         guest_count: args.party_size,
         status: "confirmed"
       };
-      const { data: booked, error: bErr } = await db.from("reservations").insert([payload]).select();
+      const { data: booked, error: bErr } = await db().from("reservations").insert([payload]).select();
       if (bErr) return text(`Reservation failed: ${bErr.message}`);
 
-      await db
+      await db()
         .from("restaurant_tables")
         .update({
           status: "reserved",
@@ -227,7 +233,7 @@ function createMcpServer() {
       const phone = digitsOnly(args.customer_phone).slice(-10);
       if (phone.length !== 10) return text("Need a 10-digit Indian mobile number.");
 
-      const { data: menu } = await db.from("menu_items").select("id, item_name, price");
+      const { data: menu } = await db().from("menu_items").select("id, item_name, price");
       const lines = args.items.map((item) => {
         const match = (menu || []).find(
           (m) => String(m.item_name || "").toLowerCase() === item.name.toLowerCase()
@@ -261,10 +267,10 @@ function createMcpServer() {
         notes: `MCP pre-book${branch ? ` | ${branch.name}` : ""}`
       };
 
-      let { data, error } = await db.from("orders").insert([fullPayload]).select();
+      let { data, error } = await db().from("orders").insert([fullPayload]).select();
       if (error) {
         const { total_amount, ...rest } = fullPayload;
-        const retry = await db.from("orders").insert([{ ...rest, total }]).select();
+        const retry = await db().from("orders").insert([{ ...rest, total }]).select();
         data = retry.data;
         error = retry.error;
       }
@@ -291,18 +297,31 @@ app.get("/health", (_req, res) => {
 });
 
 async function handleMcp(req, res) {
-  const server = createMcpServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  try {
+    const server = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("[mcp]", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  }
 }
 
 app.post("/mcp", handleMcp);
 app.get("/mcp", async (req, res) => {
-  const server = createMcpServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  await server.connect(transport);
-  await transport.handleRequest(req, res);
+  const accept = String(req.headers.accept || "");
+  if (accept.includes("text/html")) {
+    res.json({
+      ok: true,
+      service: NAME,
+      hint: "This is the MCP endpoint for Cursor/Claude. Open /health in a browser. Paste this /mcp URL into Cursor MCP settings."
+    });
+    return;
+  }
+  await handleMcp(req, res);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
