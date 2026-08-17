@@ -1,3 +1,5 @@
+import path from "path";
+import { fileURLToPath } from "url";
 import cors from "cors";
 import express from "express";
 import { z } from "zod";
@@ -5,7 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createClient } from "@supabase/supabase-js";
 import { OUTLETS, findOutlet, isOtherBrand } from "./outlets.js";
-import { resolvePhotoUrl } from "./photos.js";
+import { hostedPhotoUrl } from "./photos.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const NAME = process.env.MCP_SERVER_NAME || "truffles-guest";
@@ -142,8 +144,8 @@ function createMcpServer() {
           price: Number(row.price) || 0,
           veg: row.veg,
           category: row.menu_categories?.category_name || "Menu",
-          image_url: resolvePhotoUrl(
-            row.image_url,
+          image_url: hostedPhotoUrl(
+            PUBLIC_BASE,
             row.item_name,
             row.menu_categories?.category_name,
             idx
@@ -431,6 +433,20 @@ function createMcpServer() {
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
+const photosDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public", "photos");
+app.use(
+  "/photos",
+  express.static(photosDir, {
+    fallthrough: false,
+    maxAge: "7d",
+    setHeaders(res) {
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Content-Disposition", "inline");
+      res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+    }
+  })
+);
 
 function razorpayCheckoutPage({ ticket, amount, name }) {
   const t = escapeHtml(ticket);
