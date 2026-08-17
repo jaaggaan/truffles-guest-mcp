@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createClient } from "@supabase/supabase-js";
 import { OUTLETS, findOutlet, isOtherBrand } from "./outlets.js";
+import { resolvePhotoUrl } from "./photos.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const NAME = process.env.MCP_SERVER_NAME || "truffles-guest";
@@ -97,6 +98,12 @@ function createMcpServer() {
       title: "View menu",
       description:
         "Show the Truffles menu with dish photos. Paste the markdown from this tool into your visible reply unchanged so photos render inline. Guest picks items, then create_prebook. Share the Razorpay payment link as a button/label, never dump a raw ugly URL. Do not tell the guest to type any payment code. If they later say paid online, call confirm_payment.",
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      },
       inputSchema: {
         outlet: z.string().describe("Outlet area, e.g. Indiranagar"),
         search: z.string().optional().describe("Optional item name or category filter")
@@ -129,13 +136,18 @@ function createMcpServer() {
           const cat = String(row.menu_categories?.category_name || "").toLowerCase();
           return String(row.item_name || "").toLowerCase().includes(needle) || cat.includes(needle);
         })
-        .map((row) => ({
+        .map((row, idx) => ({
           id: row.id,
           name: row.item_name,
           price: Number(row.price) || 0,
           veg: row.veg,
           category: row.menu_categories?.category_name || "Menu",
-          image_url: row.image_url || null
+          image_url: resolvePhotoUrl(
+            row.image_url,
+            row.item_name,
+            row.menu_categories?.category_name,
+            idx
+          )
         }));
       const branch = findOutlet(outlet)[0] || OUTLETS[0];
       const byCat = new Map();
@@ -144,7 +156,7 @@ function createMcpServer() {
         if (!byCat.has(key)) byCat.set(key, []);
         byCat.get(key).push(item);
       }
-      let md = `Truffles menu — ${branch.name}\n\nPaste this markdown in your reply so every dish photo shows (do not replace photos with Show Image).\n\n`;
+      let md = `Truffles menu — ${branch.name}\n\n`;
       for (const [cat, rows] of byCat) {
         md += `## ${cat}\n\n`;
         for (const item of rows) {
