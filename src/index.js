@@ -70,20 +70,29 @@ function createMcpServer() {
           "We currently only serve Truffles in Bengaluru. Pick a Truffles outlet (Koramangala, Indiranagar, St. Marks, JP Nagar, …) to see the menu."
         );
       }
-      const { data, error } = await db()
+      let { data, error } = await db()
         .from("menu_items")
-        .select("id, item_name, price, category, is_available")
+        .select("id, item_name, price, available, veg, category_id, menu_categories(category_name)")
         .limit(80);
+      if (error) {
+        const retry = await db()
+          .from("menu_items")
+          .select("id, item_name, price, available, veg")
+          .limit(80);
+        data = retry.data;
+        error = retry.error;
+      }
       if (error) return text(`Menu read failed: ${error.message}`);
       const needle = String(search || "").toLowerCase();
       const items = (data || [])
-        .filter((row) => row.is_available !== false)
+        .filter((row) => row.available !== false)
         .filter((row) => !needle || String(row.item_name || "").toLowerCase().includes(needle))
         .map((row) => ({
           id: row.id,
           name: row.item_name,
           price: row.price,
-          category: row.category
+          veg: row.veg,
+          category: row.menu_categories?.category_name || null
         }));
       const branch = findOutlet(outlet)[0] || OUTLETS[0];
       return json({ outlet: branch, items });
@@ -109,7 +118,7 @@ function createMcpServer() {
 
       const { data: tables, error: tErr } = await db()
         .from("restaurant_tables")
-        .select("id, table_number, status, capacity, seats")
+        .select("id, table_number, status")
         .order("table_number");
       if (tErr) return text(`Table read failed: ${tErr.message}`);
 
@@ -119,8 +128,6 @@ function createMcpServer() {
         .eq("status", "confirmed");
 
       const available = (tables || []).filter((table) => {
-        const cap = Number(table.capacity || table.seats || 4);
-        if (cap < Number(party_size)) return false;
         if (BUSY.includes(String(table.status || "").toLowerCase())) return false;
         const clash = (holds || []).some((row) => {
           if (row.table_id !== table.id) return false;
