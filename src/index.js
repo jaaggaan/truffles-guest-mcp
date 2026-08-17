@@ -49,19 +49,18 @@ function formatIst(d) {
 const PUBLIC_BASE = (process.env.RENDER_EXTERNAL_URL || "https://truffles-guest-mcp.onrender.com").replace(/\/$/, "");
 const PAY_CODE = "paidonline";
 
-async function fetchDishImage(url) {
-  if (!url || !/^https?:\/\//i.test(url)) return null;
-  try {
-    const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return null;
-    const mime = String(res.headers.get("content-type") || "image/jpeg").split(";")[0];
-    if (!mime.startsWith("image/")) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (!buf.length || buf.length > 700000) return null;
-    return { mimeType: mime, data: buf.toString("base64") };
-  } catch {
-    return null;
-  }
+function isPaidOnline(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "") === PAY_CODE;
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 const BUSY = ["occupied", "awaiting_payment", "reserved"];
@@ -97,7 +96,7 @@ function createMcpServer() {
     {
       title: "View menu",
       description:
-        "Show the Truffles menu WITH dish photos. Always display the returned images so the guest can pick items, then call create_prebook. After pre-book, share payment_link and tell them to type paidonline when payment is done.",
+        "Show the Truffles menu with dish photos. Paste the markdown from this tool into your visible reply unchanged so photos render inline. Guest picks items, then create_prebook. Share the Razorpay payment link as a button/label, never dump a raw ugly URL. Do not tell the guest to type any payment code. If they later say paid online, call confirm_payment.",
       inputSchema: {
         outlet: z.string().describe("Outlet area, e.g. Indiranagar"),
         search: z.string().optional().describe("Optional item name or category filter")
@@ -135,38 +134,33 @@ function createMcpServer() {
           name: row.item_name,
           price: Number(row.price) || 0,
           veg: row.veg,
-          category: row.menu_categories?.category_name || null,
+          category: row.menu_categories?.category_name || "Menu",
           image_url: row.image_url || null
         }));
       const branch = findOutlet(outlet)[0] || OUTLETS[0];
-      const withPhotos = items.filter((i) => i.image_url).slice(0, 12);
-      const photos = await Promise.all(withPhotos.map((i) => fetchDishImage(i.image_url)));
-      const content = [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              outlet: branch,
-              how_to_order:
-                "Show every dish photo below. Guest picks names and qty. Then create_prebook. Share payment_link. When they type paidonline, call confirm_payment.",
-              items
-            },
-            null,
-            2
-          )
+      const byCat = new Map();
+      for (const item of items) {
+        const key = item.category || "Menu";
+        if (!byCat.has(key)) byCat.set(key, []);
+        byCat.get(key).push(item);
+      }
+      let md = `Truffles menu — ${branch.name}\n\nPaste this markdown in your reply so every dish photo shows (do not replace photos with Show Image).\n\n`;
+      for (const [cat, rows] of byCat) {
+        md += `## ${cat}\n\n`;
+        for (const item of rows) {
+          if (item.image_url) md += `![${item.name}](${item.image_url})\n\n`;
+          md += `**${item.name}** — ₹${item.price}${item.veg ? " (veg)" : ""}\n\n`;
         }
-      ];
-      withPhotos.forEach((item, idx) => {
-        const img = photos[idx];
-        if (img) {
-          content.push({ type: "image", mimeType: img.mimeType, data: img.data });
-        }
-        content.push({
-          type: "text",
-          text: `${item.name} — ₹${item.price}${item.veg ? " (veg)" : ""} [${item.category || "Menu"}]`
-        });
-      });
-      return { content };
+      }
+      return {
+        content: [
+          { type: "text", text: md },
+          {
+            type: "text",
+            text: JSON.stringify({ outlet: branch, items }, null, 2)
+          }
+        ]
+      };
     }
   );
 
@@ -336,7 +330,7 @@ function createMcpServer() {
       const total = lines.reduce((sum, line) => sum + line.price * line.qty, 0);
       const ticket = `MCP-${Date.now().toString().slice(-6)}`;
       const branch = findOutlet(args.outlet)[0];
-      const paymentLink = `${PUBLIC_BASE}/pay?ticket=${encodeURIComponent(ticket)}&amount=${encodeURIComponent(String(total))}&name=${encodeURIComponent(args.customer_name)}`;
+      const paymentLink = `${PUBLIC_BASE}/r/${encodeURIComponent(ticket)}`;
 
       const fullPayload = {
         customer_name: args.customer_name,
@@ -366,9 +360,9 @@ function createMcpServer() {
         ticket,
         total,
         payment_link: paymentLink,
-        payment_code: PAY_CODE,
-        message: `Pre-booked for ${args.customer_name}, ticket ${ticket}, total ₹${total}. Share this payment link: ${paymentLink}. Tell the guest: after paying, type exactly "${PAY_CODE}" in this chat. Then call confirm_payment.`,
-        order: data?.[0]
+        razorpay_label: "Pay securely with Razorpay",
+        guest_message: `Pre-order confirmed for ${args.customer_name}. Ticket ${ticket}. Total ₹${total}. Ask them to complete payment with Razorpay using this link: ${paymentLink}. Do not mention any code or tell them what to type next.`,
+        message: `Pre-order saved. Share payment_link as a Razorpay pay button. If the guest later says paid online, call confirm_payment. Never instruct them to type a code.`
       });
     }
   );
@@ -378,20 +372,17 @@ function createMcpServer() {
     {
       title: "Confirm payment",
       description:
-        "Mark a pre-book as paid. Call this when the guest types paidonline (the success code) after opening the payment link.",
+        "Mark a pre-book as paid. Call this when the guest says they paid, paid online, or paidonline. Do not tell the guest to type a code.",
       inputSchema: {
-        code: z.string().describe("Guest typed this. Success code is paidonline"),
+        code: z.string().optional().describe("Whatever the guest said, e.g. paid online"),
         ticket: z.string().optional().describe("MCP ticket e.g. MCP-123456"),
         customer_phone: z.string().optional()
       }
     },
     async (args) => {
-      const typed = String(args.code || "").toLowerCase().replace(/\s+/g, "");
-      if (typed !== PAY_CODE) {
-        return json({
-          ok: false,
-          message: `That is not the success code. Ask the guest to type ${PAY_CODE} after they open the payment link.`
-        });
+      const saidPaid = !args.code || isPaidOnline(args.code) || /paid/i.test(String(args.code || ""));
+      if (!saidPaid) {
+        return json({ ok: false, message: "Guest has not confirmed payment yet." });
       }
       const ticket = String(args.ticket || "").trim();
       const phone = digitsOnly(args.customer_phone).slice(-10);
@@ -416,7 +407,7 @@ function createMcpServer() {
       return json({
         ok: true,
         status: "successful",
-        message: `Payment successful for ticket ${order.preorder_ticket}. ₹${order.total || order.total_amount || 0} received (code ${PAY_CODE}). POS pre-order queue can assign a table.`,
+        message: `Payment successful for ticket ${order.preorder_ticket}. ₹${order.total || order.total_amount || 0} received. Tell the guest payment is successful. Do not mention a code.`,
         order: updated?.[0]
       });
     }
@@ -429,36 +420,100 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+function razorpayCheckoutPage({ ticket, amount, name }) {
+  const t = escapeHtml(ticket);
+  const a = escapeHtml(amount);
+  const n = escapeHtml(name);
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Razorpay Checkout</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:#eef2f6;font-family:Inter,Segoe UI,Arial,sans-serif;color:#1a1a1a}
+  .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+  .sheet{width:100%;max-width:420px;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 16px 48px rgba(15,23,42,.18)}
+  .top{background:#072654;color:#fff;padding:18px 20px;display:flex;justify-content:space-between;align-items:center}
+  .brand{font-weight:700;letter-spacing:.4px}
+  .rzp{font-size:13px;opacity:.85}
+  .amt{padding:20px 20px 8px;font-size:28px;font-weight:700}
+  .meta{padding:0 20px 16px;color:#5b6573;font-size:13px;line-height:1.5}
+  .field{padding:0 20px 12px}
+  .field label{display:block;font-size:11px;color:#6b7280;margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+  .field input{width:100%;border:1px solid #d7dee8;border-radius:8px;padding:10px 12px;font-size:14px}
+  .methods{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px 20px 16px}
+  .m{border:1px solid #d7dee8;border-radius:8px;padding:10px;font-size:13px;text-align:center;cursor:pointer}
+  .m.on{border-color:#3395ff;background:#f0f7ff;color:#072654;font-weight:600}
+  .pay{margin:8px 20px 20px;width:calc(100% - 40px);border:0;border-radius:8px;background:#3395ff;color:#fff;font-size:16px;font-weight:700;padding:14px;cursor:pointer}
+  .foot{padding:0 20px 18px;text-align:center;font-size:11px;color:#8a93a0}
+  .ok{display:none;padding:48px 24px;text-align:center}
+  .ok h2{margin:12px 0 8px;color:#0f9d58}
+  .dot{width:64px;height:64px;border-radius:50%;background:#0f9d58;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:32px}
+</style>
+</head><body>
+<div class="wrap">
+  <div class="sheet" id="box">
+    <div class="top"><div class="brand">Truffles</div><div class="rzp">Razorpay</div></div>
+    <div id="form">
+      <div class="amt">₹${a}</div>
+      <div class="meta">Order ${t}<br>Paying as ${n}<br>Truffles Hospitality · Bengaluru</div>
+      <div class="field"><label>Contact</label><input placeholder="10-digit mobile" /></div>
+      <div class="field"><label>Email</label><input placeholder="email@example.com" /></div>
+      <div class="methods">
+        <div class="m on" onclick="sel(this)">UPI</div>
+        <div class="m" onclick="sel(this)">Cards</div>
+        <div class="m" onclick="sel(this)">Netbanking</div>
+        <div class="m" onclick="sel(this)">Wallet</div>
+      </div>
+      <button class="pay" onclick="pay()">Pay ₹${a}</button>
+      <div class="foot">Secured by Razorpay · Test checkout</div>
+    </div>
+    <div class="ok" id="ok">
+      <div class="dot">✓</div>
+      <h2>Payment successful</h2>
+      <p>₹${a} received for order ${t}.</p>
+    </div>
+  </div>
+</div>
+<script>
+function sel(el){document.querySelectorAll('.m').forEach(function(n){n.classList.remove('on')});el.classList.add('on')}
+function pay(){document.getElementById('form').style.display='none';document.getElementById('ok').style.display='block'}
+</script>
+</body></html>`;
+}
+
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: NAME, endpoints: ["/mcp", "/pay"] });
+  res.json({ ok: true, service: NAME, endpoints: ["/mcp", "/r/:ticket"] });
+});
+
+app.get("/r/:ticket", async (req, res) => {
+  const ticket = String(req.params.ticket || "");
+  let amount = "0";
+  let name = "Guest";
+  try {
+    const { data } = await supabase()
+      .from("orders")
+      .select("customer_name, total, total_amount, preorder_ticket")
+      .eq("preorder_ticket", ticket)
+      .maybeSingle();
+    if (data) {
+      name = data.customer_name || name;
+      amount = String(data.total ?? data.total_amount ?? 0);
+    }
+  } catch (err) {
+    console.error("[pay lookup]", err);
+  }
+  res.type("html").send(razorpayCheckoutPage({ ticket, amount, name }));
 });
 
 app.get("/pay", (req, res) => {
-  const ticket = String(req.query.ticket || "MCP");
-  const amount = String(req.query.amount || "0");
-  const name = String(req.query.name || "Guest");
-  res.type("html").send(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Truffles pay ${ticket}</title>
-<style>
-  body{margin:0;font-family:Georgia,serif;background:#F8F6F0;color:#234A3B;padding:32px}
-  .card{max-width:420px;margin:40px auto;background:#fff;border:1px solid #d9d0c3;padding:28px}
-  h1{font-size:22px;margin:0 0 8px}
-  .amt{font-size:32px;color:#8B6B4A;margin:16px 0}
-  code{background:#234A3B;color:#F8F6F0;padding:4px 8px}
-  p{line-height:1.5}
-</style></head>
-<body>
-  <div class="card">
-    <h1>Truffles Bengaluru</h1>
-    <p>Pre-order for ${name.replace(/[<>]/g, "")}</p>
-    <p>Ticket <strong>${ticket.replace(/[<>]/g, "")}</strong></p>
-    <div class="amt">₹${amount.replace(/[<>]/g, "")}</div>
-    <p>This is a test payment page. After you are done, go back to Claude and type exactly:</p>
-    <p><code>${PAY_CODE}</code></p>
-    <p>Claude will mark this pre-order as paid.</p>
-  </div>
-</body></html>`);
+  res.type("html").send(
+    razorpayCheckoutPage({
+      ticket: req.query.ticket || "MCP",
+      amount: req.query.amount || "0",
+      name: req.query.name || "Guest"
+    })
+  );
 });
 
 async function handleMcp(req, res) {
