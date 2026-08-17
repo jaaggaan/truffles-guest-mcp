@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: truffles-guest-mcp
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: MCP_SERVER_NAME
+        value: truffles-guest
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
