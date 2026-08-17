@@ -26,6 +26,26 @@ const digitsOnly = (v) => String(v || "").replace(/\D/g, "");
 const json = (payload) => ({ content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] });
 const text = (message) => ({ content: [{ type: "text", text: message }] });
 
+/** Guest times are Bengaluru wall clock (IST, UTC+05:30). Render's TZ is UTC. */
+function istDateTime(date, time) {
+  const raw = `${date}T${String(time || "").padEnd(5, "0")}:00+05:30`;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatIst(d) {
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
+  }).format(d);
+}
+
 const BUSY = ["occupied", "awaiting_payment", "reserved"];
 
 function createMcpServer() {
@@ -112,8 +132,8 @@ function createMcpServer() {
       }
     },
     async ({ party_size, date, time }) => {
-      const start = new Date(`${date}T${time}:00`);
-      if (Number.isNaN(start.getTime())) return text("Use date YYYY-MM-DD and time HH:MM.");
+      const start = istDateTime(date, time);
+      if (!start) return text("Use date YYYY-MM-DD and time HH:MM (Bengaluru time).");
       const end = new Date(start.getTime() + 90 * 60 * 1000);
 
       const { data: tables, error: tErr } = await db()
@@ -140,6 +160,8 @@ function createMcpServer() {
 
       return json({
         brand: "Truffles",
+        timezone: "Asia/Kolkata",
+        display: formatIst(start),
         date,
         time,
         party_size,
@@ -171,8 +193,8 @@ function createMcpServer() {
     async (args) => {
       const phone = digitsOnly(args.customer_phone).slice(-10);
       if (phone.length !== 10) return text("Need a 10-digit Indian mobile number.");
-      const start = new Date(`${args.date}T${args.time}:00`);
-      if (Number.isNaN(start.getTime())) return text("Use date YYYY-MM-DD and time HH:MM.");
+      const start = istDateTime(args.date, args.time);
+      if (!start) return text("Use date YYYY-MM-DD and time HH:MM (Bengaluru time).");
       const end = new Date(start.getTime() + 90 * 60 * 1000);
 
       const { data: table, error: tErr } = await db()
@@ -209,7 +231,9 @@ function createMcpServer() {
 
       return json({
         ok: true,
-        message: `Reserved Truffles table ${args.table_number} for ${args.customer_name}. POS will refresh.`,
+        timezone: "Asia/Kolkata",
+        display: formatIst(start),
+        message: `Reserved Truffles table ${args.table_number} for ${args.customer_name} at ${formatIst(start)} (Bengaluru time). POS will refresh.`,
         reservation: booked?.[0]
       });
     }
