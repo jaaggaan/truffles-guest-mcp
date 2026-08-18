@@ -1,32 +1,8 @@
-/** Dish photos hosted on this MCP: GET /photos/<file>.jpg returns image/jpeg, no redirect. */
-export function photoFile(name, category, seed = 0) {
-  const t = `${name} ${category}`.toLowerCase();
-  let bucket = "burger";
-  if (/burger/.test(t)) bucket = "burger";
-  else if (/pizza/.test(t)) bucket = "pizza";
-  else if (/pasta|penne|spaghetti|fettuccine|alfredo|arrabi/.test(t)) bucket = "pasta";
-  else if (/fries|wing|onion|skewer|mushroom bite|starter/.test(t)) bucket = "starter";
-  else if (/sizzler|steak|chop|main/.test(t)) bucket = "mains";
-  else if (/brownie|cake|waffle|pie|sundae|dessert/.test(t)) bucket = "dessert";
-  else if (/shake|cooler|frappe|smoothie|macchiato|beverage|coffee/.test(t)) bucket = "drink";
-  const counts = { burger: 6, starter: 5, pizza: 3, pasta: 4, mains: 4, dessert: 4, drink: 5 };
-  const n = counts[bucket] || 6;
-  const idx = Math.abs(Number(seed) || 0) % n;
-  return `${bucket}-${idx}.jpg`;
-}
+/** Dish photos: store https URLs on menu_items.image_url, embed JPEG bytes in chat. */
 
-export function hostedPhotoUrl(base, name, category, seed = 0) {
-  const root = String(base || "https://truffles-guest-mcp.onrender.com").replace(/\/$/, "");
-  return `${root}/photos/${photoFile(name, category, seed)}`;
-}
+const COUNTS = { burger: 6, starter: 5, pizza: 3, pasta: 4, mains: 4, dessert: 4, drink: 5 };
+const MAX_IMAGE_BYTES = 180_000;
 
-export function resolvePhotoUrl(current, name, category, seed = 0, base) {
-  const url = String(current || "");
-  if (url.includes("/photos/") && !/foodish-api|unsplash\.com/i.test(url)) return url;
-  return hostedPhotoUrl(base, name, category, seed);
-}
-
-/** Source files used once to fill public/photos. Not used at request time. */
 export const PHOTO_SOURCES = {
   burger: [
     "https://images.unsplash.com/photo-1568901346375-23c9450c58cd?auto=format&fit=crop&w=800&q=70",
@@ -74,3 +50,71 @@ export const PHOTO_SOURCES = {
     "https://images.unsplash.com/photo-1485808191679-5f86510681aa?auto=format&fit=crop&w=800&q=70"
   ]
 };
+
+export function photoBucket(name, category) {
+  const t = `${name} ${category}`.toLowerCase();
+  if (/pizza/.test(t)) return "pizza";
+  if (/pasta|penne|spaghetti|fettuccine|alfredo|arrabi/.test(t)) return "pasta";
+  if (/fries|wing|onion|skewer|mushroom bite|starter/.test(t)) return "starter";
+  if (/sizzler|steak|chop|main/.test(t)) return "mains";
+  if (/brownie|cake|waffle|pie|sundae|dessert/.test(t)) return "dessert";
+  if (/shake|cooler|frappe|smoothie|macchiato|beverage|coffee/.test(t)) return "drink";
+  if (/burger/.test(t)) return "burger";
+  return "burger";
+}
+
+export function photoFile(name, category, seed = 0) {
+  const bucket = photoBucket(name, category);
+  const n = COUNTS[bucket] || 6;
+  const idx = Math.abs(Number(seed) || 0) % n;
+  return `${bucket}-${idx}.jpg`;
+}
+
+export function hostedPhotoUrl(base, name, category, seed = 0) {
+  const root = String(base || "https://truffles-guest-mcp.onrender.com").replace(/\/$/, "");
+  return `${root}/photos/${photoFile(name, category, seed)}`;
+}
+
+/** Stable Unsplash URL to persist on menu_items.image_url */
+export function sourcePhotoUrl(name, category, seed = 0) {
+  const bucket = photoBucket(name, category);
+  const list = PHOTO_SOURCES[bucket] || PHOTO_SOURCES.burger;
+  const idx = Math.abs(Number(seed) || 0) % list.length;
+  const raw = list[idx];
+  return raw.replace("w=800", "w=320");
+}
+
+export function catalogPhotoUrl(stored, name, category, seed = 0) {
+  const url = String(stored || "").trim();
+  if (/^https?:\/\//i.test(url) && !/foodish-api/i.test(url)) return url;
+  return sourcePhotoUrl(name, category, seed);
+}
+
+function compactUnsplash(url) {
+  if (!url.includes("images.unsplash.com")) return url;
+  const base = url.split("?")[0];
+  return `${base}?auto=format&fit=crop&q=70&w=320&h=320`;
+}
+
+/** MCP image block (base64). Skip junk so Claude does not show a blank thumbnail. */
+export async function fetchInlineImage(url) {
+  if (!url) return null;
+  try {
+    const res = await fetch(compactUnsplash(url), {
+      headers: { "User-Agent": "TrufflesGuestMCP/1.0" },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!res.ok) return null;
+    const ctype = (res.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
+    if (!ctype.startsWith("image/")) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length < 80 || buf.length > MAX_IMAGE_BYTES) return null;
+    return {
+      type: "image",
+      data: buf.toString("base64"),
+      mimeType: ctype
+    };
+  } catch {
+    return null;
+  }
+}

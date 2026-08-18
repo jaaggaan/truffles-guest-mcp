@@ -7,7 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createClient } from "@supabase/supabase-js";
 import { OUTLETS, findOutlet, isOtherBrand } from "./outlets.js";
-import { hostedPhotoUrl } from "./photos.js";
+import { catalogPhotoUrl, fetchInlineImage } from "./photos.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const NAME = process.env.MCP_SERVER_NAME || "truffles-guest";
@@ -99,7 +99,7 @@ function createMcpServer() {
     {
       title: "View menu",
       description:
-        "Show the Truffles menu with dish photos. Paste the markdown from this tool into your visible reply unchanged so photos render inline. Guest picks items, then create_prebook. Share the Razorpay payment link as a button/label, never dump a raw ugly URL. Do not tell the guest to type any payment code. If they later say paid online, call confirm_payment.",
+        "Show the Truffles menu. Photos are returned as real image bytes in this tool result (inline in chat). Do not convert them to markdown links. Guest picks items, then create_prebook. Share the Razorpay payment link as a button/label. If they later say paid online, call confirm_payment.",
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -131,26 +131,38 @@ function createMcpServer() {
       }
       if (error) return text(`Menu read failed: ${error.message}`);
       const needle = String(search || "").toLowerCase();
-      const items = (data || [])
+      const filtered = (data || [])
         .filter((row) => row.available !== false)
         .filter((row) => {
           if (!needle) return true;
           const cat = String(row.menu_categories?.category_name || "").toLowerCase();
           return String(row.item_name || "").toLowerCase().includes(needle) || cat.includes(needle);
-        })
-        .map((row, idx) => ({
+        });
+
+      const items = filtered.map((row, idx) => {
+        const category = row.menu_categories?.category_name || "Menu";
+        const image_url = catalogPhotoUrl(row.image_url, row.item_name, category, idx);
+        return {
           id: row.id,
           name: row.item_name,
           price: Number(row.price) || 0,
           veg: row.veg,
-          category: row.menu_categories?.category_name || "Menu",
-          image_url: hostedPhotoUrl(
-            PUBLIC_BASE,
-            row.item_name,
-            row.menu_categories?.category_name,
-            idx
-          )
-        }));
+          category,
+          image_url
+        };
+      });
+
+      const writes = [];
+      for (let i = 0; i < filtered.length; i++) {
+        const row = filtered[i];
+        const nextUrl = items[i].image_url;
+        const prev = String(row.image_url || "").trim();
+        if (row.id && nextUrl && prev !== nextUrl) {
+          writes.push(db().from("menu_items").update({ image_url: nextUrl }).eq("id", row.id));
+        }
+      }
+      if (writes.length) Promise.allSettled(writes).catch(() => {});
+
       const branch = findOutlet(outlet)[0] || OUTLETS[0];
       const byCat = new Map();
       for (const item of items) {
@@ -158,22 +170,28 @@ function createMcpServer() {
         if (!byCat.has(key)) byCat.set(key, []);
         byCat.get(key).push(item);
       }
-      let md = `Truffles menu — ${branch.name}\n\n`;
+      let listing = `Truffles menu — ${branch.name}\nPhotos are attached in this message (from menu_items.image_url). Payment stays a link after you pre-book.\n\n`;
       for (const [cat, rows] of byCat) {
-        md += `## ${cat}\n\n`;
+        listing += `## ${cat}\n`;
         for (const item of rows) {
-          if (item.image_url) md += `![${item.name}](${item.image_url})\n\n`;
-          md += `**${item.name}** — ₹${item.price}${item.veg ? " (veg)" : ""}\n\n`;
+          listing += `• ${item.name} — ₹${item.price}${item.veg ? " (veg)" : ""}\n`;
         }
+        listing += "\n";
       }
+
+      const photoItems = (needle ? items : items.slice(0, 4)).slice(0, 4);
+      listing += needle
+        ? `Showing up to ${photoItems.length} dish photo(s) for “${search}”.`
+        : "Showing 4 dish photos. Name a dish or category to see more pictures.";
+
+      const images = [];
+      for (const item of photoItems) {
+        const block = await fetchInlineImage(item.image_url);
+        if (block) images.push(block);
+      }
+
       return {
-        content: [
-          { type: "text", text: md },
-          {
-            type: "text",
-            text: JSON.stringify({ outlet: branch, items }, null, 2)
-          }
-        ]
+        content: [{ type: "text", text: listing }, ...images]
       };
     }
   );
