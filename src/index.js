@@ -8,6 +8,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createClient } from "@supabase/supabase-js";
 import { OUTLETS, findOutlet, isOtherBrand } from "./outlets.js";
 import { catalogPhotoUrl, fetchInlineImage } from "./photos.js";
+import { registerFashionTools, shoppersDb } from "./fashion.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const NAME = process.env.MCP_SERVER_NAME || "truffles-guest";
@@ -445,6 +446,8 @@ function createMcpServer() {
     }
   );
 
+  registerFashionTools(server, { text, publicBase: PUBLIC_BASE });
+
   return server;
 }
 
@@ -529,7 +532,12 @@ function pay(){document.getElementById('form').style.display='none';document.get
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: NAME, endpoints: ["/mcp", "/r/:ticket"] });
+  res.json({
+    ok: true,
+    service: NAME,
+    brands: ["truffles-food", "shoppers-stop-fashion"],
+    endpoints: ["/mcp", "/r/:ticket", "/ss/:orderId"]
+  });
 });
 
 app.get("/r/:ticket", async (req, res) => {
@@ -550,6 +558,27 @@ app.get("/r/:ticket", async (req, res) => {
     console.error("[pay lookup]", err);
   }
   res.type("html").send(razorpayCheckoutPage({ ticket, amount, name }));
+});
+
+app.get("/ss/:orderId", async (req, res) => {
+  const orderId = String(req.params.orderId || "");
+  let amount = "0";
+  let name = "Guest";
+  try {
+    const { data } = await shoppersDb()
+      .from("orders")
+      .select("customer_name, total_amount, order_id")
+      .eq("order_id", orderId)
+      .maybeSingle();
+    if (data) {
+      name = data.customer_name || name;
+      amount = String(data.total_amount ?? 0);
+    }
+  } catch (err) {
+    console.error("[ss pay lookup]", err);
+  }
+  const html = razorpayCheckoutPage({ ticket: orderId, amount, name }).replaceAll("Truffles", "Shoppers Stop");
+  res.type("html").send(html);
 });
 
 app.get("/pay", (req, res) => {
