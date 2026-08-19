@@ -68,7 +68,22 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
-const BUSY = ["occupied", "awaiting_payment", "reserved"];
+const BUSY_NOW = ["occupied", "awaiting_payment", "needs_cleaning"];
+const RESERVATION_HOLD_MS = 30 * 60 * 1000;
+
+function slotOverlapsNow(start, end, now = Date.now()) {
+  return now >= start.getTime() - RESERVATION_HOLD_MS && now < end.getTime();
+}
+
+function reservationClash(holds, tableId, startMs, endMs) {
+  return (holds || []).some((row) => {
+    if (row.table_id !== tableId) return false;
+    if (String(row.status || "").toLowerCase() !== "confirmed") return false;
+    const rowStart = new Date(row.start_time).getTime();
+    const rowEnd = row.end_time ? new Date(row.end_time).getTime() : rowStart + 90 * 60 * 1000;
+    return rowStart < endMs && rowEnd > startMs;
+  });
+}
 
 function createMcpServer() {
   const server = new McpServer({ name: NAME, version: "1.0.0" });
@@ -227,14 +242,9 @@ function createMcpServer() {
         .eq("status", "confirmed");
 
       const available = (tables || []).filter((table) => {
-        if (BUSY.includes(String(table.status || "").toLowerCase())) return false;
-        const clash = (holds || []).some((row) => {
-          if (row.table_id !== table.id) return false;
-          const rowStart = new Date(row.start_time).getTime();
-          const rowEnd = row.end_time ? new Date(row.end_time).getTime() : rowStart + 90 * 60 * 1000;
-          return rowStart < end.getTime() && rowEnd > start.getTime();
-        });
-        return !clash;
+        const status = String(table.status || "").toLowerCase();
+        if (slotOverlapsNow(start, end) && BUSY_NOW.includes(status)) return false;
+        return !reservationClash(holds, table.id, start.getTime(), end.getTime());
       });
 
       return json({
@@ -283,8 +293,17 @@ function createMcpServer() {
         .maybeSingle();
       if (tErr) return text(tErr.message);
       if (!table) return text(`Table ${args.table_number} not found.`);
-      if (BUSY.includes(String(table.status || "").toLowerCase())) {
-        return text(`Table ${args.table_number} is already reserved or occupied. Pick another table.`);
+
+      const { data: holds } = await db()
+        .from("reservations")
+        .select("id, table_id, start_time, end_time, status")
+        .eq("status", "confirmed");
+      if (reservationClash(holds, table.id, start.getTime(), end.getTime())) {
+        return text(`Table ${args.table_number} is already reserved for that time. Pick another table or slot.`);
+      }
+      const status = String(table.status || "").toLowerCase();
+      if (slotOverlapsNow(start, end) && BUSY_NOW.includes(status)) {
+        return text(`Table ${args.table_number} is occupied right now. Pick another table.`);
       }
 
       const payload = {
@@ -299,20 +318,22 @@ function createMcpServer() {
       const { data: booked, error: bErr } = await db().from("reservations").insert([payload]).select();
       if (bErr) return text(`Reservation failed: ${bErr.message}`);
 
-      await db()
-        .from("restaurant_tables")
-        .update({
-          status: "reserved",
-          customer_name: args.customer_name,
-          customer_phone: phone
-        })
-        .eq("id", table.id);
+      if (slotOverlapsNow(start, end)) {
+        await db()
+          .from("restaurant_tables")
+          .update({
+            status: "reserved",
+            customer_name: args.customer_name,
+            customer_phone: phone
+          })
+          .eq("id", table.id);
+      }
 
       return json({
         ok: true,
         timezone: "Asia/Kolkata",
         display: formatIst(start),
-        message: `Reserved Truffles table ${args.table_number} for ${args.customer_name} at ${formatIst(start)} (Bengaluru time). POS will refresh.`,
+        message: `Reserved Truffles table ${args.table_number} for ${args.customer_name} at ${formatIst(start)} (Bengaluru time). It appears on the POS table map 30 minutes before the booking.`,
         reservation: booked?.[0]
       });
     }
